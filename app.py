@@ -6,22 +6,24 @@ import os
 from datetime import datetime
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for your frontend
+CORS(app)
 
-# File to cache scraped data
 DATA_FILE = 'nepse_data.json'
 
 def load_cached_data():
     """Load previously scraped data from cache"""
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return None
     return None
 
 def save_data_to_cache(data):
     """Save scraped data to cache file"""
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 @app.route('/', methods=['GET'])
 def home():
@@ -29,13 +31,16 @@ def home():
     return jsonify({
         'name': 'Nepal IPO Scraper API',
         'version': '1.0.0',
+        'description': 'Real-time IPO, bonus, dividend, and right share data for Nepal share market',
         'endpoints': {
             '/api/ipos': 'Get all IPO announcements',
             '/api/bonus': 'Get bonus share announcements',
             '/api/dividends': 'Get dividend announcements',
             '/api/right-shares': 'Get right share announcements',
+            '/api/agm': 'Get AGM announcements',
             '/api/all': 'Get all data combined',
             '/api/latest': 'Get only most recent announcements',
+            '/api/summary': 'Get summary statistics',
             '/health': 'Check API status'
         }
     })
@@ -45,34 +50,54 @@ def health_check():
     """Health check endpoint for Render"""
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
 
+@app.route('/api/summary', methods=['GET'])
+def get_summary():
+    """Get summary statistics"""
+    data = load_cached_data()
+    
+    if not data:
+        data = scrape_nepse_data()
+        save_data_to_cache(data)
+    
+    return jsonify({
+        'last_updated': data.get('last_updated'),
+        'statistics': {
+            'total_announcements': data.get('total_count', 0),
+            'ipos': len(data.get('ipos', [])),
+            'bonus_shares': len(data.get('bonus_shares', [])),
+            'dividends': len(data.get('dividends', [])),
+            'right_shares': len(data.get('right_shares', [])),
+            'agm': len(data.get('agm', []))
+        }
+    })
+
 @app.route('/api/all', methods=['GET'])
 def get_all_data():
     """Get all scraped data"""
     data = load_cached_data()
     
-    if not data:
-        # If no cache, scrape fresh
+    if not data or 'error' in data:
         data = scrape_nepse_data()
         save_data_to_cache(data)
     
-    # Add metadata
-    data['api_timestamp'] = datetime.now().isoformat()
+    # Add API timestamp
+    response_data = data.copy()
+    response_data['api_timestamp'] = datetime.now().isoformat()
     
-    # Optional: filter by date range
+    # Optional: filter by date
     from_date = request.args.get('from')
     to_date = request.args.get('to')
     
     if from_date or to_date:
-        filtered_data = {'last_updated': data['last_updated']}
-        for category in ['ipos', 'bonus_shares', 'dividends', 'right_shares']:
-            filtered_data[category] = [
-                item for item in data.get(category, [])
-                if (not from_date or item['date'] >= from_date) and
-                   (not to_date or item['date'] <= to_date)
-            ]
-        return jsonify(filtered_data)
+        for category in ['ipos', 'bonus_shares', 'dividends', 'right_shares', 'agm']:
+            if category in response_data:
+                response_data[category] = [
+                    item for item in response_data.get(category, [])
+                    if (not from_date or item['date'] >= from_date) and
+                       (not to_date or item['date'] <= to_date)
+                ]
     
-    return jsonify(data)
+    return jsonify(response_data)
 
 @app.route('/api/ipos', methods=['GET'])
 def get_ipos():
@@ -114,30 +139,63 @@ def get_right_shares():
         'last_updated': data.get('last_updated')
     })
 
+@app.route('/api/agm', methods=['GET'])
+def get_agm():
+    """Get AGM announcements"""
+    data = load_cached_data() or scrape_nepse_data()
+    return jsonify({
+        'count': len(data.get('agm', [])),
+        'data': data.get('agm', []),
+        'last_updated': data.get('last_updated')
+    })
+
 @app.route('/api/latest', methods=['GET'])
 def get_latest():
     """Get latest 20 announcements across all categories"""
     data = load_cached_data() or scrape_nepse_data()
     
     all_announcements = []
-    for category in ['ipos', 'bonus_shares', 'dividends', 'right_shares']:
+    for category in ['ipos', 'bonus_shares', 'dividends', 'right_shares', 'agm']:
         all_announcements.extend(data.get(category, []))
     
     # Sort by date (newest first)
     all_announcements.sort(key=lambda x: x['date'], reverse=True)
+    limit = request.args.get('limit', 20, type=int)
     
     return jsonify({
-        'count': min(20, len(all_announcements)),
-        'data': all_announcements[:20],
+        'count': min(limit, len(all_announcements)),
+        'data': all_announcements[:limit],
         'last_updated': data.get('last_updated')
     })
 
-# Auto-scrape on startup (for cron jobs)
+@app.route('/api/search', methods=['GET'])
+def search():
+    """Search announcements by keyword"""
+    query = request.args.get('q', '').lower()
+    if not query:
+        return jsonify({'error': 'Search query required'}), 400
+    
+    data = load_cached_data() or scrape_nepse_data()
+    
+    results = []
+    for category in ['ipos', 'bonus_shares', 'dividends', 'right_shares', 'agm']:
+        for item in data.get(category, []):
+            if query in item.get('announcement', '').lower() or query in item.get('company', '').lower():
+                results.append(item)
+    
+    return jsonify({
+        'query': query,
+        'count': len(results),
+        'data': results,
+        'last_updated': data.get('last_updated')
+    })
+
+# Auto-scrape on startup
 def auto_scrape():
-    print(f"[{datetime.now()}] Running auto-scrape...")
+    print(f"[{datetime.now()}] Running auto-scrape on startup...")
     data = scrape_nepse_data()
     save_data_to_cache(data)
-    print(f"[{datetime.now()}] Scrape complete. Found {len(data.get('ipos', []))} IPOs")
+    print(f"[{datetime.now()}] Scrape complete. Found {data.get('total_count', 0)} announcements")
 
 if __name__ == '__main__':
     # Run initial scrape on startup
